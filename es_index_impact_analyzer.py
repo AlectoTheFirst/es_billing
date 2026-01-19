@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import urllib3
+from urllib3.util import ssl_ as urllib3_ssl
 from requests.adapters import HTTPAdapter
 
 DEFAULT_INDEX_PATTERN = r"^logstash-(.+)-\d+$"
@@ -34,6 +35,7 @@ HEAP_USAGE_KEYS = (
 CLUSTER_COST = 1000.0
 REPORT_WIDTH = 80
 NAME_WIDTH = 40
+_URLLIB3_SSL_PATCHED = False
 
 
 class InsecureHTTPSAdapter(HTTPAdapter):
@@ -50,6 +52,27 @@ class InsecureHTTPSAdapter(HTTPAdapter):
     def proxy_manager_for(self, proxy, **proxy_kwargs):
         proxy_kwargs["ssl_context"] = self._ssl_context
         return super().proxy_manager_for(proxy, **proxy_kwargs)
+
+
+def apply_insecure_tls(session: requests.Session) -> None:
+    global _URLLIB3_SSL_PATCHED
+
+    session.verify = False
+    session.trust_env = False
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    session.mount("https://", InsecureHTTPSAdapter())
+
+    if not _URLLIB3_SSL_PATCHED:
+        original = urllib3_ssl.create_urllib3_context
+
+        def insecure_context(*args, **kwargs):
+            ctx = original(*args, **kwargs)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            return ctx
+
+        urllib3_ssl.create_urllib3_context = insecure_context
+        _URLLIB3_SSL_PATCHED = True
 
 
 def parse_args() -> argparse.Namespace:
@@ -495,9 +518,7 @@ def main() -> int:
     if args.user and args.password:
         session.auth = (args.user, args.password)
     if args.insecure:
-        session.verify = False
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        session.mount("https://", InsecureHTTPSAdapter())
+        apply_insecure_tls(session)
 
     try:
         stats = request_json(
