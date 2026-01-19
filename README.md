@@ -150,6 +150,7 @@ Cluster totals: disk 10240.00G, heap 65536MB (data nodes)
 Total log groups analyzed: 15
 Total impact score: 0.0500
 Matched indices share of cluster: 5.00%
+Unallocated cluster share: 95.00%
 Storage column uses total store size (primaries + replicas).
 
 --------------------------------------------------------------------------------

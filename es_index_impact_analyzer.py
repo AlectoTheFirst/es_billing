@@ -361,8 +361,11 @@ def render_report(
     lines.append("")
     lines.append(f"Total log groups analyzed: {len(groups)}")
     if score_mode == "normalized":
+        matched_share = min(max(total_impact, 0.0), 1.0)
+        unmatched_share = max(0.0, 1.0 - matched_share)
         lines.append(f"Total impact score: {total_impact:.4f}")
-        lines.append(f"Matched indices share of cluster: {total_impact * 100:.2f}%")
+        lines.append(f"Matched indices share of cluster: {matched_share * 100:.2f}%")
+        lines.append(f"Unallocated cluster share: {unmatched_share * 100:.2f}%")
     else:
         lines.append(f"Total impact score: {total_impact:.2f}")
     lines.append("Storage column uses total store size (primaries + replicas).")
