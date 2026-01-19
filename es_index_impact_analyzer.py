@@ -119,19 +119,90 @@ def to_int(value: Any) -> int:
         return 0
 
 
-def fetch_cluster_capacity(session: requests.Session, base_url: str) -> Dict[str, float]:
-    stats = request_json(session, f"{base_url}/_cluster/stats", params={})
-    nodes = stats.get("nodes", {})
-    fs_total_bytes = nodes.get("fs", {}).get("total_in_bytes", 0)
-    heap_max_bytes = nodes.get("jvm", {}).get("mem", {}).get("heap_max_in_bytes", 0)
+def is_data_node(roles: List[str]) -> bool:
+    if not roles:
+        return True
+    return any(role == "data" or role.startswith("data_") for role in roles)
+
+
+def fetch_cluster_info(session: requests.Session, base_url: str) -> Dict[str, float]:
+    stats = request_json(
+        session,
+        f"{base_url}/_nodes/stats/jvm,fs",
+        params={
+            "filter_path": (
+                "nodes.*.roles,"
+                "nodes.*.jvm.mem.heap_max_in_bytes,"
+                "nodes.*.fs.total.total_in_bytes"
+            )
+        },
+    )
+    disk_total_bytes = 0
+    heap_max_bytes = 0
+    data_nodes = 0
+
+    for node in stats.get("nodes", {}).values():
+        roles = node.get("roles", [])
+        if not is_data_node(roles):
+            continue
+        data_nodes += 1
+        heap_max_bytes += node.get("jvm", {}).get("mem", {}).get("heap_max_in_bytes", 0)
+        disk_total_bytes += node.get("fs", {}).get("total", {}).get("total_in_bytes", 0)
 
     return {
-        "disk_total_gb": bytes_to_gb(fs_total_bytes),
+        "disk_total_gb": bytes_to_gb(disk_total_bytes),
         "heap_max_mb": bytes_to_mb(heap_max_bytes),
+        "data_nodes": data_nodes,
     }
 
 
-def collect_index_metrics(stats: Dict[str, Any], settings: Dict[str, Any]) -> List[Dict[str, Any]]:
+def parse_auto_expand(value: str) -> Tuple[int, Optional[int]]:
+    parts = value.split("-", 1)
+    if len(parts) != 2:
+        return 0, None
+    min_replicas = to_int(parts[0])
+    max_token = parts[1]
+    if max_token == "all":
+        return min_replicas, None
+    return min_replicas, to_int(max_token)
+
+
+def parse_replicas(value: Any, auto_expand: Any, data_nodes: int) -> int:
+    if value is None:
+        value = ""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        pass
+
+    auto_value = auto_expand if auto_expand and auto_expand != "false" else str(value)
+    if not auto_value or auto_value == "false":
+        return 0
+
+    min_rep, max_rep = parse_auto_expand(str(auto_value))
+    if data_nodes > 0:
+        replicas = max(min_rep, data_nodes - 1)
+        if max_rep is not None:
+            replicas = min(replicas, max_rep)
+        return replicas
+    return min_rep
+
+
+def needs_data_nodes(settings: Dict[str, Any]) -> bool:
+    for entry in settings.values():
+        index_settings = entry.get("settings", {}).get("index", {})
+        auto_expand = index_settings.get("auto_expand_replicas")
+        replicas = index_settings.get("number_of_replicas")
+        if auto_expand and auto_expand != "false":
+            return True
+        if isinstance(replicas, str) and ("-" in replicas or replicas == "all"):
+            return True
+    return False
+
+
+def collect_index_metrics(
+    stats: Dict[str, Any], settings: Dict[str, Any], data_nodes: int
+) -> List[Dict[str, Any]]:
     metrics: List[Dict[str, Any]] = []
     for index_name, index_stats in stats.get("indices", {}).items():
         primaries = index_stats.get("primaries", {})
@@ -148,7 +219,11 @@ def collect_index_metrics(stats: Dict[str, Any], settings: Dict[str, Any]) -> Li
 
         settings_index = settings.get(index_name, {}).get("settings", {}).get("index", {})
         num_shards = to_int(settings_index.get("number_of_shards"))
-        num_replicas = to_int(settings_index.get("number_of_replicas"))
+        num_replicas = parse_replicas(
+            settings_index.get("number_of_replicas"),
+            settings_index.get("auto_expand_replicas"),
+            data_nodes,
+        )
         shard_count = num_shards * (1 + num_replicas)
 
         metrics.append(
@@ -278,14 +353,18 @@ def render_report(
             lines.append(
                 "Cluster totals: "
                 f"disk {capacity.get('disk_total_gb', 0.0):.2f}G, "
-                f"heap {capacity.get('heap_max_mb', 0.0):.0f}MB"
+                f"heap {capacity.get('heap_max_mb', 0.0):.0f}MB (data nodes)"
             )
     else:
         lines.append("Scoring mode: weighted")
         lines.append(f"Weights used: {json.dumps(weights, indent=2)}")
     lines.append("")
     lines.append(f"Total log groups analyzed: {len(groups)}")
-    lines.append(f"Total impact score: {total_impact:.2f}")
+    if score_mode == "normalized":
+        lines.append(f"Total impact score: {total_impact:.4f}")
+        lines.append(f"Matched indices share of cluster: {total_impact * 100:.2f}%")
+    else:
+        lines.append(f"Total impact score: {total_impact:.2f}")
     lines.append("Storage column uses total store size (primaries + replicas).")
     lines.append("")
     lines.append("-" * REPORT_WIDTH)
@@ -294,11 +373,12 @@ def render_report(
     )
     lines.append("-" * REPORT_WIDTH)
 
+    impact_format = "{:>10.4f}" if score_mode == "normalized" else "{:>10.2f}"
     for group in display_groups:
         storage_display = f"{group['metrics']['total_storage_gb']:.2f}G"
         lines.append(
             f"{group['log_name']:<{NAME_WIDTH}}"
-            f" {group['impact_score']:>10.2f}"
+            f" {impact_format.format(group['impact_score'])}"
             f" {storage_display:>10}"
             f" {group['metrics']['total_shards']:>8d}"
             f" {group['index_count']:>8d}"
@@ -315,8 +395,12 @@ def render_report(
     lines.append("-" * REPORT_WIDTH)
 
     for group in display_groups:
-        impact_pct = (group["impact_score"] / total_impact * 100.0) if total_impact else 0.0
-        estimated_cost = CLUSTER_COST * (impact_pct / 100.0)
+        if score_mode == "normalized":
+            impact_pct = group["impact_score"] * 100.0
+            estimated_cost = CLUSTER_COST * group["impact_score"]
+        else:
+            impact_pct = (group["impact_score"] / total_impact * 100.0) if total_impact else 0.0
+            estimated_cost = CLUSTER_COST * (impact_pct / 100.0)
         lines.append(
             f"{group['log_name']:<{NAME_WIDTH}}"
             f" {impact_pct:>8.2f}%"
@@ -335,7 +419,7 @@ def build_json_output(display_groups: List[Dict[str, Any]]) -> str:
             {
                 "log_name": group["log_name"],
                 "index_count": group["index_count"],
-                "impact_score": round(group["impact_score"], 2),
+                "impact_score": round(group["impact_score"], 6),
                 "metrics": {
                     "primary_storage_gb": round(group["metrics"]["primary_storage_gb"], 3),
                     "total_storage_gb": round(group["metrics"]["total_storage_gb"], 3),
@@ -400,29 +484,46 @@ def main() -> int:
             session,
             f"{base_url}/_settings",
             params={
-                "filter_path": "**.settings.index.number_of_shards,**.settings.index.number_of_replicas"
+                "filter_path": (
+                    "**.settings.index.number_of_shards,"
+                    "**.settings.index.number_of_replicas,"
+                    "**.settings.index.auto_expand_replicas"
+                )
             },
         )
     except requests.RequestException as exc:
         print(f"Failed to fetch data from {base_url}: {exc}", file=sys.stderr)
         return 1
 
-    capacity: Optional[Dict[str, float]] = None
-    if args.score_mode == "normalized":
+    cluster_info: Optional[Dict[str, float]] = None
+    needs_cluster_info = args.score_mode == "normalized" or needs_data_nodes(settings)
+    if needs_cluster_info:
         try:
-            capacity = fetch_cluster_capacity(session, base_url)
+            cluster_info = fetch_cluster_info(session, base_url)
         except requests.RequestException as exc:
+            if args.score_mode == "normalized":
+                print(
+                    f"Failed to fetch cluster capacity from {base_url}: {exc}",
+                    file=sys.stderr,
+                )
+                return 1
             print(
-                f"Failed to fetch cluster capacity from {base_url}: {exc}",
+                f"Failed to fetch node stats from {base_url}: {exc}",
                 file=sys.stderr,
             )
-            return 1
+            print(
+                "Auto-expand replica counts may be inaccurate without node stats.",
+                file=sys.stderr,
+            )
 
-        disk_total = capacity.get("disk_total_gb", 0.0)
-        heap_total = capacity.get("heap_max_mb", 0.0)
+    data_nodes = int(cluster_info.get("data_nodes", 0)) if cluster_info else 0
+
+    if args.score_mode == "normalized":
+        disk_total = cluster_info.get("disk_total_gb", 0.0) if cluster_info else 0.0
+        heap_total = cluster_info.get("heap_max_mb", 0.0) if cluster_info else 0.0
         if not disk_total and not heap_total:
             print(
-                "Cluster capacity totals are unavailable; normalized scoring requires cluster stats.",
+                "Cluster capacity totals are unavailable; normalized scoring requires node stats.",
                 file=sys.stderr,
             )
             print("Use --score-mode weighted to bypass capacity-based scoring.", file=sys.stderr)
@@ -439,7 +540,7 @@ def main() -> int:
                 file=sys.stderr,
             )
 
-    index_metrics = collect_index_metrics(stats, settings)
+    index_metrics = collect_index_metrics(stats, settings, data_nodes)
     try:
         index_pattern = re.compile(args.index_pattern)
     except re.error as exc:
@@ -464,7 +565,7 @@ def main() -> int:
         print("No indices matched the expected pattern.", file=sys.stderr)
         return 1
 
-    groups = apply_scoring(groups, args.score_mode, weights, capacity)
+    groups = apply_scoring(groups, args.score_mode, weights, cluster_info)
 
     display_groups = groups[: args.top] if args.top else groups
     total_impact = sum(group["impact_score"] for group in groups)
@@ -473,7 +574,7 @@ def main() -> int:
         output = build_json_output(display_groups)
     else:
         output = render_report(
-            groups, display_groups, args.score_mode, weights, total_impact, capacity
+            groups, display_groups, args.score_mode, weights, total_impact, cluster_info
         )
 
     write_output(output, args.output, args.json)

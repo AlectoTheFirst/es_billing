@@ -81,8 +81,8 @@ impact_score = (total_storage_gb / cluster_disk_total_gb) +
 heap_usage_mb = segment_memory_mb + fielddata_mb + query_cache_mb + request_cache_mb
 ```
 
-Cluster totals are pulled from `/_cluster/stats` and represent the provisioned
-capacity of the cluster.
+Cluster totals are pulled from `/_nodes/stats` and include data nodes only
+(roles starting with `data`).
 
 ### Weighted (opt-in)
 
@@ -145,18 +145,19 @@ ELASTICSEARCH INDEX IMPACT ANALYSIS FOR BILLING
 ================================================================================
 
 Scoring mode: normalized (cluster capacity)
-Cluster totals: disk 10240.00G, heap 65536MB
+Cluster totals: disk 10240.00G, heap 65536MB (data nodes)
 
 Total log groups analyzed: 15
-Total impact score: 5.00
+Total impact score: 0.0500
+Matched indices share of cluster: 5.00%
 Storage column uses total store size (primaries + replicas).
 
 --------------------------------------------------------------------------------
 Log Name                                     Impact    Storage   Shards  Indices
 --------------------------------------------------------------------------------
-nginx-access                                   1.84     45.23G       30        5
-application-logs                               1.17     28.11G       24        4
-security-audit                                 0.53     12.45G       12        2
+nginx-access                                 0.0184     45.23G       30        5
+application-logs                             0.0117     28.11G       24        4
+security-audit                               0.0053     12.45G       12        2
 ...
 
 ================================================================================
@@ -165,9 +166,9 @@ BILLING PERCENTAGE BREAKDOWN
 
 Log Name                                     Impact %   Estimated Monthly $
 --------------------------------------------------------------------------------
-nginx-access                                   36.88%            $368.78
-application-logs                               23.41%            $234.09
-security-audit                                 10.53%            $105.29
+nginx-access                                    1.84%             $18.40
+application-logs                                1.17%             $11.70
+security-audit                                  0.53%              $5.30
 ...
 (Based on example cluster cost of $1000/month)
 ```
@@ -179,7 +180,7 @@ security-audit                                 10.53%            $105.29
   {
     "log_name": "nginx-access",
     "index_count": 5,
-    "impact_score": 312.45,
+    "impact_score": 0.0184,
     "metrics": {
       "primary_storage_gb": 45.234,
       "total_storage_gb": 90.468,
