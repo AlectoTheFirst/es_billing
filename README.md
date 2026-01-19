@@ -70,17 +70,17 @@ You can override the regex with `--index-pattern`.
 
 ### Normalized (default)
 
-The default mode is self-calibrating: each metric is normalized by the total
-usage across matched indices.
+The default mode is capacity-based: each group is scored against cluster totals.
 
 ```
-impact_score = sum(metric / total_metric)
+impact_score = (total_storage_gb / cluster_disk_total_gb) +
+               (heap_usage_mb / cluster_heap_max_mb)
+
+heap_usage_mb = segment_memory_mb + fielddata_mb + query_cache_mb + request_cache_mb
 ```
 
-Metrics included: `primary_storage_gb`, `total_shards`, `total_segments`,
-`fielddata_mb`, `query_cache_mb`.
-
-Totals are computed across matched indices (the same indices used for billing).
+Cluster totals are pulled from `/_cluster/stats` and represent the provisioned
+capacity of the cluster.
 
 ### Weighted (opt-in)
 
@@ -91,6 +91,7 @@ impact_score = (storage_gb × W1) + (shard_count × W2) + (segment_count × W3) 
 ```
 
 Enable with `--score-mode weighted` and adjust weights as needed.
+`storage_gb` uses total storage (primaries + replicas).
 
 ### Default Weights (weighted mode)
 
@@ -125,7 +126,7 @@ For each index:
 | Metric | Source API | Description |
 |--------|------------|-------------|
 | Primary store size | `/_stats` | Disk usage (primary shards only) |
-| Total store size | `/_stats` | Disk usage including replicas |
+| Total store size | `/_stats` | Disk usage including replicas (used for capacity scoring) |
 | Document count | `/_stats` | Number of documents |
 | Shard count | `/_settings` | Primary × (1 + replicas) |
 | Segment count | `/_stats` | Number of Lucene segments |
@@ -141,10 +142,12 @@ For each index:
 ELASTICSEARCH INDEX IMPACT ANALYSIS FOR BILLING
 ================================================================================
 
-Scoring mode: normalized (metrics normalized by matched indices totals)
+Scoring mode: normalized (cluster capacity)
+Cluster totals: disk 10240.00G, heap 65536MB
 
 Total log groups analyzed: 15
 Total impact score: 5.00
+Storage column uses total store size (primaries + replicas).
 
 --------------------------------------------------------------------------------
 Log Name                                     Impact    Storage   Shards  Indices

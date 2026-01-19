@@ -15,13 +15,19 @@ DEFAULT_WEIGHTS = {
     "fielddata_mb": 2.0,
     "query_cache_mb": 0.5,
 }
-SCORE_METRICS = {
-    "primary_storage_gb": "storage_gb",
+WEIGHTED_METRICS = {
+    "total_storage_gb": "storage_gb",
     "total_shards": "shard_count",
     "total_segments": "segment_count",
     "fielddata_mb": "fielddata_mb",
     "query_cache_mb": "query_cache_mb",
 }
+HEAP_USAGE_KEYS = (
+    "segment_memory_mb",
+    "fielddata_mb",
+    "query_cache_mb",
+    "request_cache_mb",
+)
 CLUSTER_COST = 1000.0
 REPORT_WIDTH = 80
 NAME_WIDTH = 40
@@ -50,7 +56,7 @@ def parse_args() -> argparse.Namespace:
         "--score-mode",
         choices=["normalized", "weighted"],
         default="normalized",
-        help="Scoring mode: normalized (default) or weighted.",
+        help="Scoring mode: normalized (default, cluster capacity) or weighted.",
     )
 
     parser.add_argument(
@@ -106,6 +112,18 @@ def to_int(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+def fetch_cluster_capacity(session: requests.Session, base_url: str) -> Dict[str, float]:
+    stats = request_json(session, f"{base_url}/_cluster/stats", params={})
+    nodes = stats.get("nodes", {})
+    fs_total_bytes = nodes.get("fs", {}).get("total_in_bytes", 0)
+    heap_max_bytes = nodes.get("jvm", {}).get("mem", {}).get("heap_max_in_bytes", 0)
+
+    return {
+        "disk_total_gb": bytes_to_gb(fs_total_bytes),
+        "heap_max_mb": bytes_to_mb(heap_max_bytes),
+    }
 
 
 def collect_index_metrics(stats: Dict[str, Any], settings: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -200,40 +218,40 @@ def group_by_logname(
 
 
 def calculate_weighted_impact(metrics: Dict[str, Any], weights: Dict[str, float]) -> float:
-    return sum(metrics[key] * weights[weight_key] for key, weight_key in SCORE_METRICS.items())
+    return sum(
+        metrics[key] * weights[weight_key] for key, weight_key in WEIGHTED_METRICS.items()
+    )
 
 
-def calculate_normalized_impact(metrics: Dict[str, Any], totals: Dict[str, float]) -> float:
+def calculate_capacity_impact(metrics: Dict[str, Any], capacity: Dict[str, float]) -> float:
     score = 0.0
-    for key in SCORE_METRICS:
-        total = totals.get(key, 0.0)
-        if total:
-            score += metrics[key] / total
+    disk_total_gb = capacity.get("disk_total_gb", 0.0)
+    heap_max_mb = capacity.get("heap_max_mb", 0.0)
+
+    if disk_total_gb:
+        score += metrics["total_storage_gb"] / disk_total_gb
+
+    if heap_max_mb:
+        heap_usage_mb = sum(metrics[key] for key in HEAP_USAGE_KEYS)
+        score += heap_usage_mb / heap_max_mb
+
     return score
 
 
-def compute_totals(groups: List[Dict[str, Any]]) -> Dict[str, float]:
-    totals = {key: 0.0 for key in SCORE_METRICS}
-    for group in groups:
-        for key in totals:
-            totals[key] += group["metrics"][key]
-    return totals
-
-
 def apply_scoring(
-    groups: List[Dict[str, Any]], score_mode: str, weights: Dict[str, float]
-) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
-    totals: Dict[str, float] = {}
+    groups: List[Dict[str, Any]],
+    score_mode: str,
+    weights: Dict[str, float],
+    capacity: Optional[Dict[str, float]],
+) -> List[Dict[str, Any]]:
     if score_mode == "normalized":
-        totals = compute_totals(groups)
         for group in groups:
-            group["impact_score"] = calculate_normalized_impact(group["metrics"], totals)
+            group["impact_score"] = calculate_capacity_impact(group["metrics"], capacity or {})
     else:
         for group in groups:
             group["impact_score"] = calculate_weighted_impact(group["metrics"], weights)
 
-    sorted_groups = sorted(groups, key=lambda g: g["impact_score"], reverse=True)
-    return sorted_groups, totals
+    return sorted(groups, key=lambda g: g["impact_score"], reverse=True)
 
 
 def render_report(
@@ -242,6 +260,7 @@ def render_report(
     score_mode: str,
     weights: Dict[str, float],
     total_impact: float,
+    capacity: Optional[Dict[str, float]],
 ) -> str:
     lines: List[str] = []
     lines.append("=" * REPORT_WIDTH)
@@ -249,13 +268,20 @@ def render_report(
     lines.append("=" * REPORT_WIDTH)
     lines.append("")
     if score_mode == "normalized":
-        lines.append("Scoring mode: normalized (metrics normalized by matched indices totals)")
+        lines.append("Scoring mode: normalized (cluster capacity)")
+        if capacity:
+            lines.append(
+                "Cluster totals: "
+                f"disk {capacity.get('disk_total_gb', 0.0):.2f}G, "
+                f"heap {capacity.get('heap_max_mb', 0.0):.0f}MB"
+            )
     else:
         lines.append("Scoring mode: weighted")
         lines.append(f"Weights used: {json.dumps(weights, indent=2)}")
     lines.append("")
     lines.append(f"Total log groups analyzed: {len(groups)}")
     lines.append(f"Total impact score: {total_impact:.2f}")
+    lines.append("Storage column uses total store size (primaries + replicas).")
     lines.append("")
     lines.append("-" * REPORT_WIDTH)
     lines.append(
@@ -264,7 +290,7 @@ def render_report(
     lines.append("-" * REPORT_WIDTH)
 
     for group in display_groups:
-        storage_display = f"{group['metrics']['primary_storage_gb']:.2f}G"
+        storage_display = f"{group['metrics']['total_storage_gb']:.2f}G"
         lines.append(
             f"{group['log_name']:<{NAME_WIDTH}}"
             f" {group['impact_score']:>10.2f}"
@@ -374,6 +400,38 @@ def main() -> int:
         print(f"Failed to fetch data from {base_url}: {exc}", file=sys.stderr)
         return 1
 
+    capacity: Optional[Dict[str, float]] = None
+    if args.score_mode == "normalized":
+        try:
+            capacity = fetch_cluster_capacity(session, base_url)
+        except requests.RequestException as exc:
+            print(
+                f"Failed to fetch cluster capacity from {base_url}: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+
+        disk_total = capacity.get("disk_total_gb", 0.0)
+        heap_total = capacity.get("heap_max_mb", 0.0)
+        if not disk_total and not heap_total:
+            print(
+                "Cluster capacity totals are unavailable; normalized scoring requires cluster stats.",
+                file=sys.stderr,
+            )
+            print("Use --score-mode weighted to bypass capacity-based scoring.", file=sys.stderr)
+            return 1
+        if not disk_total or not heap_total:
+            missing = []
+            if not disk_total:
+                missing.append("disk total")
+            if not heap_total:
+                missing.append("heap max")
+            print(
+                "Normalized scoring will skip missing capacity metrics: "
+                + ", ".join(missing),
+                file=sys.stderr,
+            )
+
     index_metrics = collect_index_metrics(stats, settings)
     try:
         index_pattern = re.compile(args.index_pattern)
@@ -399,15 +457,7 @@ def main() -> int:
         print("No indices matched the expected pattern.", file=sys.stderr)
         return 1
 
-    groups, totals = apply_scoring(groups, args.score_mode, weights)
-    if args.score_mode == "normalized":
-        zero_metrics = [key for key, value in totals.items() if value == 0]
-        if zero_metrics:
-            printable = ", ".join(zero_metrics)
-            print(
-                f"Normalization skipped for metrics with zero totals: {printable}",
-                file=sys.stderr,
-            )
+    groups = apply_scoring(groups, args.score_mode, weights, capacity)
 
     display_groups = groups[: args.top] if args.top else groups
     total_impact = sum(group["impact_score"] for group in groups)
@@ -415,7 +465,9 @@ def main() -> int:
     if args.json:
         output = build_json_output(display_groups)
     else:
-        output = render_report(groups, display_groups, args.score_mode, weights, total_impact)
+        output = render_report(
+            groups, display_groups, args.score_mode, weights, total_impact, capacity
+        )
 
     write_output(output, args.output, args.json)
     return 0
