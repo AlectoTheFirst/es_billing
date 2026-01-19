@@ -6,6 +6,7 @@ import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+import urllib3
 
 DEFAULT_INDEX_PATTERN = r"^logstash-(.+)-\d+$"
 DEFAULT_WEIGHTS = {
@@ -98,8 +99,10 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def request_json(session: requests.Session, url: str, params: Dict[str, str]) -> Dict[str, Any]:
-    response = session.get(url, params=params, timeout=30)
+def request_json(
+    session: requests.Session, url: str, params: Dict[str, str], verify: bool
+) -> Dict[str, Any]:
+    response = session.get(url, params=params, timeout=30, verify=verify)
     response.raise_for_status()
     return response.json()
 
@@ -125,7 +128,7 @@ def is_data_node(roles: List[str]) -> bool:
     return any(role == "data" or role.startswith("data_") for role in roles)
 
 
-def fetch_cluster_info(session: requests.Session, base_url: str) -> Dict[str, float]:
+def fetch_cluster_info(session: requests.Session, base_url: str, verify: bool) -> Dict[str, float]:
     stats = request_json(
         session,
         f"{base_url}/_nodes/stats/jvm,fs",
@@ -136,6 +139,7 @@ def fetch_cluster_info(session: requests.Session, base_url: str) -> Dict[str, fl
                 "nodes.*.fs.total.total_in_bytes"
             )
         },
+        verify=verify,
     )
     disk_total_bytes = 0
     heap_max_bytes = 0
@@ -469,10 +473,12 @@ def main() -> int:
     base_url = f"{scheme}://{args.host}:{args.port}"
 
     session = requests.Session()
+    verify = not args.insecure
     if args.user and args.password:
         session.auth = (args.user, args.password)
     if args.insecure:
         session.verify = False
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     try:
         stats = request_json(
@@ -482,6 +488,7 @@ def main() -> int:
                 "metric": "store,docs,segments,fielddata,query_cache,request_cache",
                 "level": "indices",
             },
+            verify=verify,
         )
         settings = request_json(
             session,
@@ -493,6 +500,7 @@ def main() -> int:
                     "**.settings.index.auto_expand_replicas"
                 )
             },
+            verify=verify,
         )
     except requests.RequestException as exc:
         print(f"Failed to fetch data from {base_url}: {exc}", file=sys.stderr)
@@ -502,7 +510,7 @@ def main() -> int:
     needs_cluster_info = args.score_mode == "normalized" or needs_data_nodes(settings)
     if needs_cluster_info:
         try:
-            cluster_info = fetch_cluster_info(session, base_url)
+            cluster_info = fetch_cluster_info(session, base_url, verify)
         except requests.RequestException as exc:
             if args.score_mode == "normalized":
                 print(
