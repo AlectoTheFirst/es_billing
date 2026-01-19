@@ -2,11 +2,13 @@
 import argparse
 import json
 import re
+import ssl
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import urllib3
+from requests.adapters import HTTPAdapter
 
 DEFAULT_INDEX_PATTERN = r"^logstash-(.+)-\d+$"
 DEFAULT_WEIGHTS = {
@@ -32,6 +34,22 @@ HEAP_USAGE_KEYS = (
 CLUSTER_COST = 1000.0
 REPORT_WIDTH = 80
 NAME_WIDTH = 40
+
+
+class InsecureHTTPSAdapter(HTTPAdapter):
+    def __init__(self) -> None:
+        self._ssl_context = ssl.create_default_context()
+        self._ssl_context.check_hostname = False
+        self._ssl_context.verify_mode = ssl.CERT_NONE
+        super().__init__()
+
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        pool_kwargs["ssl_context"] = self._ssl_context
+        return super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
+
+    def proxy_manager_for(self, proxy, **proxy_kwargs):
+        proxy_kwargs["ssl_context"] = self._ssl_context
+        return super().proxy_manager_for(proxy, **proxy_kwargs)
 
 
 def parse_args() -> argparse.Namespace:
@@ -479,6 +497,7 @@ def main() -> int:
     if args.insecure:
         session.verify = False
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        session.mount("https://", InsecureHTTPSAdapter())
 
     try:
         stats = request_json(
