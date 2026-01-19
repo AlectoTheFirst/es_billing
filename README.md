@@ -27,6 +27,8 @@ python es_index_impact_analyzer.py \
     --ssl
 ```
 
+Use `--insecure` to skip TLS verification if your cluster uses self-signed certs.
+
 ### Output as JSON
 
 ```bash

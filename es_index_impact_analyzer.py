@@ -41,6 +41,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--user", help="Username for basic auth")
     parser.add_argument("--password", help="Password for basic auth")
     parser.add_argument("--ssl", action="store_true", help="Use HTTPS")
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help="Skip TLS certificate verification (HTTPS only).",
+    )
     parser.add_argument("--json", action="store_true", help="Output JSON")
     parser.add_argument("-o", "--output", help="Write output to a file")
     parser.add_argument("--top", type=int, help="Show only top consumers")
@@ -379,6 +384,8 @@ def main() -> int:
     session = requests.Session()
     if args.user and args.password:
         session.auth = (args.user, args.password)
+    if args.insecure:
+        session.verify = False
 
     try:
         stats = request_json(
